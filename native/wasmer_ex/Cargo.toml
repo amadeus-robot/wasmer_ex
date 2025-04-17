@@ -1,0 +1,14 @@
+[package]
+name = "wasmer_ex"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[lib]
+name = "wasmer_ex"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.36.1"
+wasmer = "5.0.4"
+wasmer-compiler-singlepass = "5.0.4"
