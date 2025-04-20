@@ -2224,6 +2224,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmer-middlewares"
+version = "5.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "371b38abbba1a0fb747bee025d3a40c776842be4a2052b7a3ca18bd2db80669d"
+dependencies = [
+ "wasmer",
+ "wasmer-types",
+ "wasmer-vm",
+]
+
+[[package]]
 name = "wasmer-types"
 version = "5.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2277,6 +2288,7 @@ dependencies = [
  "rustler",
  "wasmer",
  "wasmer-compiler-singlepass",
+ "wasmer-middlewares",
 ]
 
 [[package]]
