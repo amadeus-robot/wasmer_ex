@@ -1,4 +1,4 @@
-use rustler::types::{Binary, OwnedBinary};
+use rustler::types::{Binary, OwnedBinary, LocalPid};
 use rustler::{Encoder, Error, Env, Term, NifResult, ResourceArc, OwnedEnv, Atom};
 
 use wasmer::{
@@ -19,11 +19,19 @@ use wasmer_middlewares::{
 
 use std::collections::HashMap;
 
+use rand::random;
+use std::{sync::{LazyLock, Mutex, mpsc}};
+static REQ_REGISTRY: LazyLock<Mutex<HashMap<u64, mpsc::Sender<String>>>> = 
+    LazyLock::new(|| {
+        Mutex::new(HashMap::new())
+    });
+
 mod atoms {
     rustler::atoms! {
         ok,
         error,
-        nil
+        nil,
+        rust_request
     }
 }
 
@@ -37,7 +45,58 @@ struct HostEnv {
     error: Option<Vec<u8>>,
     return_value: Option<Vec<u8>>,
     logs: Vec<Vec<u8>>,
+    rpc_pid: LocalPid,
 }
+
+//RPC LOL
+#[rustler::nif]
+fn respond_to_rust<'a>(env: Env<'a>, request_id: u64, response: String) -> NifResult<Term> {
+    let mut map = REQ_REGISTRY.lock().unwrap();
+
+    if let Some(tx) = map.remove(&request_id) {
+        let _ = tx.send(response);
+        Ok(atoms::ok().encode(env))
+    } else {
+        Ok((atoms::error(), "no_request_found").encode(env))
+    }
+}
+
+fn request_from_rust(reply_to_pid: LocalPid, request: String) -> i64 {
+    let mut env = OwnedEnv::new();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+
+    let payload = (
+        atoms::rust_request(),
+        request_id,
+        request
+    );
+    let _ = env.send_and_clear(&reply_to_pid, |env| payload.encode(env));
+    //env.send(&reply_to_pid, payload);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(response) => {
+            // Return {:ok, response} to the Elixir caller
+            println!("rpc OK");
+            1
+        }
+        Err(_) => {
+            println!("rpc TIMEOUT");
+
+            // If we time out or there's an error, remove from the registry so we don't leak.
+            let mut map = REQ_REGISTRY.lock().unwrap();
+            map.remove(&request_id);
+            0
+        }
+    }
+}
+
 
 //AssemblyScript specific
 fn abort_implementation(mut env: FunctionEnvMut<HostEnv>, _message: i32, _fileName: i32, line: i32, column: i32) -> Result<(), RuntimeError> {
@@ -119,6 +178,9 @@ fn import_call_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32,
     let mut buffer = vec![0u8; module_len as usize];
     match view.read(module_ptr as u64, &mut buffer) {
         Ok(_) => {
+            let lol = request_from_rust(data.rpc_pid, "hello".to_string());
+            println!("lolao {}", lol);
+            //let _ = call_inner(env.)
             Ok(1)
         }
         Err(read_err) => { Err(RuntimeError::new("invalid_memory")) }
@@ -153,8 +215,29 @@ fn cost_function(operator: &Operator) -> u64 {
     }*/
 }
 
-#[rustler::nif]
-pub fn call<'a>(env: Env<'a>, wasm_bytes: Binary, readonly: bool, mapenv: Term<'a>, function_name: String, function_args: Vec<Term<'a>>) -> Result<rustler::Term<'a>, rustler::Error> {
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn call<'a>(env: Env<'a>, rpc_pid: LocalPid, wasm_bytes: Binary, readonly: bool, mapenv: Term<'a>, function_name: String, function_args: Vec<Term<'a>>) -> Result<rustler::Term<'a>, rustler::Error> {
+    //let wasm_vec = wasm_bytes.as_slice().to_vec();
+    
+    //let mapenv_decoded: HashMap<String, Term<'a>> = mapenv.decode()?;
+
+    //let (s1, s2, str_vec, number, bytes_vec) = call_inner(env, wasm_bytes, readonly, mapenv, function_name, function_args);
+    //Ok((s1, s2, str_vec, number, bytes_vec).encode(env))
+
+    call_inner(env, rpc_pid, wasm_bytes, readonly, mapenv, function_name, function_args)
+}
+
+fn call_inner<'a>(
+    env: Env<'a>,
+    rpc_pid: LocalPid,
+    wasm_bytes: Binary,
+    readonly: bool,
+    //mapenv: HashMap<String, Term<'a>>,
+    mapenv: Term<'a>,
+    function_name: String,
+    function_args: Vec<Term<'a>>,
+//) -> (String, String, Vec<String>, u64, Vec<u8>) {
+) -> Result<rustler::Term<'a>, rustler::Error> {
 
     let metering = Arc::new(Metering::new(3_000, cost_function));
     let mut compiler = Singlepass::default();
@@ -236,7 +319,7 @@ pub fn call<'a>(env: Env<'a>, wasm_bytes: Binary, readonly: bool, mapenv: Term<'
         }
     }
 
-    let host_env = FunctionEnv::new(&mut store, HostEnv { memory: None, error: None, return_value: None, logs: vec![], readonly: readonly});
+    let host_env = FunctionEnv::new(&mut store, HostEnv { memory: None, error: None, return_value: None, logs: vec![], readonly: readonly, rpc_pid: rpc_pid});
     let import_log_func = Function::new_typed_with_env(&mut store, &host_env, import_log_implementation);
     let import_call_func = Function::new_typed_with_env(&mut store, &host_env, import_call_implementation);
     let import_return_value_func = Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation);
