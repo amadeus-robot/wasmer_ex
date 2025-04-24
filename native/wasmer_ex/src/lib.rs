@@ -5,13 +5,13 @@ use wasmer::{
     imports,
     wasmparser::Operator,
     sys::{EngineBuilder, Features},
-    Function, FunctionEnv, FunctionEnvMut, FunctionType, Global, Instance, Memory, MemoryType,
+    Function, FunctionEnv, FunctionEnvMut, FunctionType, Global, Instance, Memory, MemoryType, Engine,
     MemoryView, Module, Pages, Store, Type, Value,
     RuntimeError
 };
 use wasmer_compiler_singlepass::Singlepass;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use wasmer_middlewares::{
     metering::{get_remaining_points, set_remaining_points, MeteringPoints},
     Metering,
@@ -19,9 +19,30 @@ use wasmer_middlewares::{
 
 use std::collections::HashMap;
 
+use sha2::{Sha256, Digest};
+static MODULE_CACHE: OnceLock<Mutex<HashMap<[u8; 32], (Arc<Engine>, Arc<Module>)>>> = OnceLock::new();
+
 use rand::random;
-use std::{sync::{LazyLock, Mutex, mpsc}};
-static REQ_REGISTRY: LazyLock<Mutex<HashMap<u64, mpsc::Sender<String>>>> = 
+use std::{sync::{LazyLock, mpsc}};
+static REQ_REGISTRY_STORAGE_KV_GET: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Option<Vec<u8>> >>>> = 
+    LazyLock::new(|| {
+        Mutex::new(HashMap::new())
+    });
+static REQ_REGISTRY_STORAGE_KV_EXISTS: LazyLock<Mutex<HashMap<u64, mpsc::Sender< bool >>>> = 
+    LazyLock::new(|| {
+        Mutex::new(HashMap::new())
+    });
+static REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Option<Vec<u8>>, Option<Vec<u8>>) >>>> = 
+    LazyLock::new(|| {
+        Mutex::new(HashMap::new())
+    });
+
+static REQ_REGISTRY_STORAGE: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Vec<u8> >>>> = 
+    LazyLock::new(|| {
+        Mutex::new(HashMap::new())
+    });
+
+static REQ_REGISTRY_CALL: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64, Vec<u8>) >>>> = 
     LazyLock::new(|| {
         Mutex::new(HashMap::new())
     });
@@ -31,7 +52,18 @@ mod atoms {
         ok,
         error,
         nil,
-        rust_request
+
+        rust_request_call,
+
+        rust_request_storage_kv_put,
+        rust_request_storage_kv_increment,
+        rust_request_storage_kv_delete,
+        rust_request_storage_kv_clear,
+
+        rust_request_storage_kv_get,
+        rust_request_storage_kv_exists,
+        rust_request_storage_kv_get_prev,
+        rust_request_storage_kv_get_next,
     }
 }
 
@@ -39,19 +71,49 @@ mod atoms {
 struct ExitCode(u32);
 
 #[derive(Clone)]
+//struct HostEnv<'a> {
 struct HostEnv {
     memory: Option<Memory>,
     readonly: bool,
     error: Option<Vec<u8>>,
     return_value: Option<Vec<u8>>,
     logs: Vec<Vec<u8>>,
+    current_account: Vec<u8>,
     rpc_pid: LocalPid,
+    //env: Env<'a>
+    instance: Option<Arc<Instance>>,
 }
+//unsafe impl Sync for HostEnv<'_> {}
+//unsafe impl Send for HostEnv<'_> {}
+
+
 
 //RPC LOL
 #[rustler::nif]
-fn respond_to_rust<'a>(env: Env<'a>, request_id: u64, response: String) -> NifResult<Term> {
-    let mut map = REQ_REGISTRY.lock().unwrap();
+fn respond_to_rust_storage_kv_get<'a>(env: Env<'a>, request_id: u64, response: Option<Vec<u8>>) -> NifResult<Term> {
+    let mut map = REQ_REGISTRY_STORAGE_KV_GET.lock().unwrap();
+
+    if let Some(tx) = map.remove(&request_id) {
+        let _ = tx.send(response);
+        Ok(atoms::ok().encode(env))
+    } else {
+        Ok((atoms::error(), "no_request_found").encode(env))
+    }
+}
+#[rustler::nif]
+fn respond_to_rust_storage_kv_exists<'a>(env: Env<'a>, request_id: u64, response: bool) -> NifResult<Term> {
+    let mut map = REQ_REGISTRY_STORAGE_KV_EXISTS.lock().unwrap();
+
+    if let Some(tx) = map.remove(&request_id) {
+        let _ = tx.send(response);
+        Ok(atoms::ok().encode(env))
+    } else {
+        Ok((atoms::error(), "no_request_found").encode(env))
+    }
+}
+#[rustler::nif]
+fn respond_to_rust_storage_kv_get_prev_next<'a>(env: Env<'a>, request_id: u64, response: (Option<Vec<u8>>, Option<Vec<u8>>)) -> NifResult<Term> {
+    let mut map = REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT.lock().unwrap();
 
     if let Some(tx) = map.remove(&request_id) {
         let _ = tx.send(response);
@@ -61,57 +123,53 @@ fn respond_to_rust<'a>(env: Env<'a>, request_id: u64, response: String) -> NifRe
     }
 }
 
-fn request_from_rust(reply_to_pid: LocalPid, request: String) -> i64 {
-    let mut env = OwnedEnv::new();
+#[rustler::nif]
+fn respond_to_rust_storage<'a>(env: Env<'a>, request_id: u64, response: Vec<u8>) -> NifResult<Term> {
+    let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
 
-    let (tx, rx) = mpsc::channel::<String>();
-    let request_id = rand::random::<u64>();
-    {
-        let mut map = REQ_REGISTRY.lock().unwrap();
-        map.insert(request_id, tx);
-    }
-
-
-    let payload = (
-        atoms::rust_request(),
-        request_id,
-        request
-    );
-    let _ = env.send_and_clear(&reply_to_pid, |env| payload.encode(env));
-    //env.send(&reply_to_pid, payload);
-
-    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
-        Ok(response) => {
-            // Return {:ok, response} to the Elixir caller
-            println!("rpc OK");
-            1
-        }
-        Err(_) => {
-            println!("rpc TIMEOUT");
-
-            // If we time out or there's an error, remove from the registry so we don't leak.
-            let mut map = REQ_REGISTRY.lock().unwrap();
-            map.remove(&request_id);
-            0
-        }
+    if let Some(tx) = map.remove(&request_id) {
+        let _ = tx.send(response);
+        Ok(atoms::ok().encode(env))
+    } else {
+        Ok((atoms::error(), "no_request_found").encode(env))
     }
 }
 
+#[rustler::nif]
+fn respond_to_rust_call<'a>(env: Env<'a>, request_id: u64, main_error: Vec<u8>, user_error: Vec<u8>, logs: Vec<Vec<u8>>, exec_cost: u64, result: Vec<u8>) -> NifResult<Term> {
+    let mut map = REQ_REGISTRY_CALL.lock().unwrap();
+
+    if let Some(tx) = map.remove(&request_id) {
+        let _ = tx.send( (main_error, user_error, logs, exec_cost, result) );
+        Ok(atoms::ok().encode(env))
+    } else {
+        Ok((atoms::error(), "no_request_found").encode(env))
+    }
+}
 
 //AssemblyScript specific
 fn abort_implementation(mut env: FunctionEnvMut<HostEnv>, _message: i32, _fileName: i32, line: i32, column: i32) -> Result<(), RuntimeError> {
     let (data, store) = env.data_and_store_mut();
-    //data.error = Some(b"abort".to_vec());
-    //print!("abort>> line: {} column: {} \n", line, column);
     Err(RuntimeError::new("abort"))
 }
 
 fn import_log_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32) -> Result<(), RuntimeError> {
-    let (data, store) = env.data_and_store_mut();
-    let memory = match &data.memory {
-        Some(mem) => mem,
-        None => { return Err(RuntimeError::new("invalid_memory")) }
+    let (data, mut store) = env.data_and_store_mut();
+
+    //charge exec cost
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
     };
+
+    let storage_cost = (len as u64) * 1000;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
 
     let mut buffer = vec![0u8; len as usize];
@@ -126,11 +184,22 @@ fn import_log_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i3
 }
 
 fn import_return_value_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32) -> Result<(), RuntimeError> {
-    let (data, store) = env.data_and_store_mut();
-    let memory = match &data.memory {
-        Some(mem) => mem,
-        None => { return Err(RuntimeError::new("invalid_memory")) }
+    let (data, mut store) = env.data_and_store_mut();
+    
+    //charge exec cost
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
     };
+
+    let storage_cost = (len as u64) * 1000;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
 
     let mut buffer = vec![0u8; len as usize];
@@ -144,31 +213,547 @@ fn import_return_value_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32
     }
 }
 
-fn import_kv_increment_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32, amount: i64) -> Result<i64, RuntimeError> {
-    let (data, store) = env.data_and_store_mut();
-    if (data.readonly) {
-        return Err(RuntimeError::new("read_only"))
+
+
+//MOVE THESE OUT TO SEPERATA FILES
+//KVGET
+fn request_from_rust_storage_kv_get(reply_to_pid: LocalPid, key: Vec<u8>) -> (std::sync::mpsc::Receiver< Option<Vec<u8>> >, u64) {
+    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE_KV_GET.lock().unwrap();
+        map.insert(request_id, tx);
     }
-    let memory = match &data.memory {
-        Some(mem) => mem,
-        None => { return Err(RuntimeError::new("invalid_memory")) }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let payload = (
+                atoms::rust_request_storage_kv_get(), 
+                request_id, 
+                Binary::from_owned(owned_key, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_get_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
     };
+
+    let storage_cost = (48 + (key_len as u64)) * 100;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
 
-    let mut buffer = vec![0u8; len as usize];
-    match view.read(ptr as u64, &mut buffer) {
-        Ok(_) => {
-            //println!("key was {} {}", String::from_utf8_lossy(&buffer), amount);
+    let mut key_buffer_suffix = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(&key_buffer_suffix);
 
-            Ok(amount)
+    let (rx, request_id) = request_from_rust_storage_kv_get(data.rpc_pid, key_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(option_response) => { 
+            match option_response {
+                Some(response) => {
+                    println!("rpc OK with Some(...)");
+                    let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+                    Ok(30_000)
+                },
+                None => {
+                    println!("rpc OK with None");
+                    let _ = view.write(30_000, &(-1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+                    Ok(30_000)
+                }
+            }
+        },
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE_KV_GET.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
         }
-        Err(read_err) => { Err(RuntimeError::new("invalid_memory")) }
     }
 }
 
+///EXISTS
+fn request_from_rust_storage_kv_exists(reply_to_pid: LocalPid, key: Vec<u8>) -> (std::sync::mpsc::Receiver< bool >, u64) {
+    let (tx, rx) = mpsc::channel::<bool>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE_KV_EXISTS.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let payload = (
+                atoms::rust_request_storage_kv_exists(), 
+                request_id, 
+                Binary::from_owned(owned_key, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_exists_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
+    };
+
+    let storage_cost = (48 + (key_len as u64)) * 100;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut key_buffer_suffix = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(&key_buffer_suffix);
+
+    let (rx, request_id) = request_from_rust_storage_kv_exists(data.rpc_pid, key_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(true) => {
+            let _ = view.write(30_000, &(1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+            Ok(30_000)
+        },
+        Ok(false) => {
+            let _ = view.write(30_000, &(0 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+            Ok(30_000)
+        },
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE_KV_EXISTS.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
+///PREV
+fn request_from_rust_storage_kv_get_prev(reply_to_pid: LocalPid, suffix: Vec<u8>, key: Vec<u8>) -> (std::sync::mpsc::Receiver< (Option<Vec<u8>>, Option<Vec<u8>>) >, u64) {
+    let (tx, rx) = mpsc::channel::< (Option<Vec<u8>>, Option<Vec<u8>>) >();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_suffix = OwnedBinary::new(suffix.len()).unwrap();
+            owned_suffix.as_mut_slice().copy_from_slice(&suffix);
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let payload = (
+                atoms::rust_request_storage_kv_get_prev(), 
+                request_id, 
+                Binary::from_owned(owned_suffix, cenv),
+                Binary::from_owned(owned_key, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_get_prev_implementation(mut env: FunctionEnvMut<HostEnv>, suffix_ptr: i32, suffix_len: i32, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
+    };
+
+    let storage_cost = (48 + (key_len as u64)) * 100;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut suffix_buffer_suffix = vec![0u8; suffix_len as usize];
+    let Ok(_) = view.read(suffix_ptr as u64, &mut suffix_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut suffix_buffer = data.current_account.clone();
+    suffix_buffer.extend_from_slice(&suffix_buffer_suffix);
+
+    let mut key_buffer = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+
+    let (rx, request_id) = request_from_rust_storage_kv_get_prev(data.rpc_pid, suffix_buffer, key_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok((maybe_prev_key, maybe_value)) => {
+            match (maybe_prev_key, maybe_value) {
+                (Some(prev_key), Some(value)) => {
+                    println!("Got Some(prev_key), Some(value)");
+                    let _ = view.write(30_000, &((prev_key.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_004, &prev_key).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_000+4+(prev_key.len() as u64), &((value.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_004+4+(prev_key.len() as u64)+4, &value).map_err(|err| RuntimeError::new("invalid_memory"));
+                    Ok(30_000)
+                },
+                _ => {
+                    let _ = view.write(30_000, &(-1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+                    Ok(30_000)
+                }
+            }
+        },
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
+
+///NEXT
+fn request_from_rust_storage_kv_get_next(reply_to_pid: LocalPid, suffix: Vec<u8>, key: Vec<u8>) -> (std::sync::mpsc::Receiver< (Option<Vec<u8>>, Option<Vec<u8>>) >, u64) {
+    let (tx, rx) = mpsc::channel::< (Option<Vec<u8>>, Option<Vec<u8>>) >();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_suffix = OwnedBinary::new(suffix.len()).unwrap();
+            owned_suffix.as_mut_slice().copy_from_slice(&suffix);
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let payload = (
+                atoms::rust_request_storage_kv_get_next(), 
+                request_id, 
+                Binary::from_owned(owned_suffix, cenv),
+                Binary::from_owned(owned_key, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_get_next_implementation(mut env: FunctionEnvMut<HostEnv>, suffix_ptr: i32, suffix_len: i32, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
+    };
+
+    let storage_cost = (48 + (key_len as u64)) * 100;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut suffix_buffer_suffix = vec![0u8; suffix_len as usize];
+    let Ok(_) = view.read(suffix_ptr as u64, &mut suffix_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut suffix_buffer = data.current_account.clone();
+    suffix_buffer.extend_from_slice(&suffix_buffer_suffix);
+
+    let mut key_buffer = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+
+    let (rx, request_id) = request_from_rust_storage_kv_get_next(data.rpc_pid, suffix_buffer, key_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok((maybe_next_key, maybe_value)) => {
+            match (maybe_next_key, maybe_value) {
+                (Some(next_key), Some(value)) => {
+                    println!("Got Some(next_key), Some(value)");
+                    let _ = view.write(30_000, &((next_key.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_004, &next_key).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_000+4+(next_key.len() as u64), &((value.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_004+4+(next_key.len() as u64)+4, &value).map_err(|err| RuntimeError::new("invalid_memory"));
+                    Ok(30_000)
+                },
+                _ => {
+                    let _ = view.write(30_000, &(-1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+                    Ok(30_000)
+                }
+            }
+        },
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
+//PUT
+fn request_from_rust_storage_kv_put<'a>(reply_to_pid: LocalPid, key: Vec<u8>, val: Vec<u8>) -> (std::sync::mpsc::Receiver<Vec<u8>>, u64) {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let mut owned_val = OwnedBinary::new(val.len()).unwrap();
+            owned_val.as_mut_slice().copy_from_slice(&val);
+            let payload = (
+                atoms::rust_request_storage_kv_put(), 
+                request_id, 
+                Binary::from_owned(owned_key, cenv),
+                Binary::from_owned(owned_val, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_put_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+    if data.readonly { return Err(RuntimeError::new("read_only")) }
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    //let instance_ref: &Instance = instance_arc.as_ref();
+    //let Some(instance) = &data.instance else { return Err(RuntimeError::new("invalid_instance")) };
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
+    };
+
+    let storage_cost = (48 + (key_len as u64) + (val_len as u64)) * 1000;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut key_buffer_suffix = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(&key_buffer_suffix);
+
+    let mut val_buffer = vec![0u8; val_len as usize];
+    let Ok(_) = view.read(val_ptr as u64, &mut val_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+
+    let (rx, request_id) = request_from_rust_storage_kv_put(data.rpc_pid, key_buffer, val_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(response) => { 
+            println!("rpc OK");
+            let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+            let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+            Ok(30_000)
+        }
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
+
+//INCREMENT
+fn request_from_rust_storage_kv_increment<'a>(reply_to_pid: LocalPid, key: Vec<u8>, val: Vec<u8>) -> (std::sync::mpsc::Receiver<Vec<u8>>, u64) {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let mut owned_val = OwnedBinary::new(val.len()).unwrap();
+            owned_val.as_mut_slice().copy_from_slice(&val);
+            let payload = (
+                atoms::rust_request_storage_kv_increment(), 
+                request_id, 
+                Binary::from_owned(owned_key, cenv),
+                Binary::from_owned(owned_val, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_increment_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+    if data.readonly { return Err(RuntimeError::new("read_only")) }
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
+    };
+
+    let storage_cost = (48 + (key_len as u64) + (val_len as u64)) * 1000;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut key_buffer_suffix = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(&key_buffer_suffix);
+
+    let mut val_buffer = vec![0u8; val_len as usize];
+    let Ok(_) = view.read(val_ptr as u64, &mut val_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+
+    let (rx, request_id) = request_from_rust_storage_kv_increment(data.rpc_pid, key_buffer, val_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(response) => { 
+            println!("rpc OK");
+            let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+            let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+            Ok(30_000)
+        }
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
+//DELETE
+fn request_from_rust_storage_kv_delete<'a>(reply_to_pid: LocalPid, key: Vec<u8>) -> (std::sync::mpsc::Receiver<Vec<u8>>, u64) {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_key = OwnedBinary::new(key.len()).unwrap();
+            owned_key.as_mut_slice().copy_from_slice(&key);
+            let payload = (
+                atoms::rust_request_storage_kv_delete(), 
+                request_id, 
+                Binary::from_owned(owned_key, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_delete_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+    if data.readonly { return Err(RuntimeError::new("read_only")) }
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
+    };
+
+    let storage_cost = (48 + (key_len as u64)) * 1000;
+    remaining_u64 = remaining_u64 - storage_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut key_buffer_suffix = vec![0u8; key_len as usize];
+    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(&key_buffer_suffix);
+
+    let (rx, request_id) = request_from_rust_storage_kv_delete(data.rpc_pid, key_buffer);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(response) => { 
+            println!("rpc OK");
+            let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+            let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+            Ok(30_000)
+        }
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
+//CALL
+fn request_from_rust_call<'a>(reply_to_pid: LocalPid, module: Vec<u8>, function: Vec<u8>, args: Vec<u8>) -> (std::sync::mpsc::Receiver< (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64, Vec<u8>) >, u64) {
+    let (tx, rx) = mpsc::channel::< (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64, Vec<u8>) >();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_CALL.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+
+            let mut owned_module = OwnedBinary::new(module.len()).unwrap();
+            owned_module.as_mut_slice().copy_from_slice(&module);
+            let mut owned_function = OwnedBinary::new(function.len()).unwrap();
+            owned_function.as_mut_slice().copy_from_slice(&function);
+            let mut owned_args = OwnedBinary::new(args.len()).unwrap();
+            owned_args.as_mut_slice().copy_from_slice(&args);
+
+            let payload = (
+                atoms::rust_request_call(), 
+                request_id, 
+                Binary::from_owned(owned_module, cenv),
+                Binary::from_owned(owned_function, cenv),
+                Binary::from_owned(owned_args, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
 fn import_call_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32, module_len: i32, 
     function_ptr: i32, function_len: i32, args_ptr: i32, args_len: i32) -> Result<i32, RuntimeError> {
-    let (data, store) = env.data_and_store_mut();
+  /*  let (data, store) = env.data_and_store_mut();
     let memory = match &data.memory {
         Some(mem) => mem,
         None => { return Err(RuntimeError::new("invalid_memory")) }
@@ -178,17 +763,16 @@ fn import_call_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32,
     let mut buffer = vec![0u8; module_len as usize];
     match view.read(module_ptr as u64, &mut buffer) {
         Ok(_) => {
-            let lol = request_from_rust(data.rpc_pid, "hello".to_string());
-            println!("lolao {}", lol);
-            //let _ = call_inner(env.)
+            let lol = request_from_rust_call(data.rpc_pid, "hello".to_string());
             Ok(1)
         }
         Err(read_err) => { Err(RuntimeError::new("invalid_memory")) }
-    }
+    }*/
+    Ok(1)
 }
 
 fn cost_function(operator: &Operator) -> u64 {
-    2
+    10
     /*match operator {
         Operator::Loop { .. }
         | Operator::Block { .. }
@@ -223,10 +807,69 @@ pub fn call<'a>(env: Env<'a>, rpc_pid: LocalPid, wasm_bytes: Binary, readonly: b
 
     //let (s1, s2, str_vec, number, bytes_vec) = call_inner(env, wasm_bytes, readonly, mapenv, function_name, function_args);
     //Ok((s1, s2, str_vec, number, bytes_vec).encode(env))
-
+    /*
+    let payload = (
+        atoms::rust_request(),
+        rpc_pid,
+    );
+    let _ = env.send(&rpc_pid, payload);
+    */
     call_inner(env, rpc_pid, wasm_bytes, readonly, mapenv, function_name, function_args)
 }
 
+use std::time::{Duration, SystemTime};
+
+/*
+fn get_or_compile_module(wasm_bytes: &[u8]) -> Result<(Arc<Engine>, Arc<Module>), rustler::Error> {
+    let cache_mutex = MODULE_CACHE.get_or_init(|| {
+        Mutex::new(HashMap::new())
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(wasm_bytes);
+    let hash = hasher.finalize().into();
+    {
+        let cache = cache_mutex.lock().unwrap();
+        if let Some((cached_engine, cached_module)) = cache.get(&hash) {
+            return Ok((Arc::clone(cached_engine), Arc::clone(cached_module)));
+        }
+    }
+
+    let metering = Arc::new(Metering::new(10_000_000, cost_function));
+    let mut compiler = Singlepass::default();
+    compiler.canonicalize_nans(true);
+
+    use wasmer::CompilerConfig;
+    compiler.push_middleware(metering);
+
+    let mut features = Features::new();
+    //features.bulk_memory(false); #required for modern compilers to WASM
+    features.threads(false);
+    features.reference_types(false);
+    features.simd(false);
+    features.multi_value(false);
+    features.tail_call(false);
+    features.module_linking(false);
+    features.multi_memory(false);
+    features.memory64(false);
+
+    //let engine = EngineBuilder::new(compiler).set_features(Some(features));
+    //let mut store = Store::new(engine);
+
+    let engine = Arc::new(EngineBuilder::new(compiler).set_features(Some(features)));
+    let store = Store::new(Arc::clone(&engine));
+
+    let module = Module::new(&store, &wasm_bytes).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+
+    let arc_module = Arc::new(module);
+    {
+        let mut cache = cache_mutex.lock().unwrap();
+        cache.insert(hash, (Arc::clone(&engine), Arc::clone(&arc_module)));
+    }
+
+    Ok((engine, arc_module))
+}
+*/
 fn call_inner<'a>(
     env: Env<'a>,
     rpc_pid: LocalPid,
@@ -238,8 +881,15 @@ fn call_inner<'a>(
     function_args: Vec<Term<'a>>,
 //) -> (String, String, Vec<String>, u64, Vec<u8>) {
 ) -> Result<rustler::Term<'a>, rustler::Error> {
+    //TODO: caching
+/*
+    let module_arc = get_or_compile_module(wasm_bytes.as_slice());
+    let module_ref: &Module = Arc::as_ref(&module_arc);  // Deref the Arc
+    let mut store = Store::new(module_ref.engine().clone());
+*/
 
-    let metering = Arc::new(Metering::new(3_000, cost_function));
+
+    let metering = Arc::new(Metering::new(10_000_000, cost_function));
     let mut compiler = Singlepass::default();
     compiler.canonicalize_nans(true);
 
@@ -261,6 +911,11 @@ fn call_inner<'a>(
     let mut store = Store::new(engine);
 
     let module = Module::new(&store, &wasm_bytes.as_slice()).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+
+
+
+    //let mut duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    //println!("ns2 {}", duration_since_epoch.as_nanos());
 
     let memory = Memory::new(&mut store, MemoryType::new(Pages(8), None, false)).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     // memory.view(&mut store).copy_to_memory
@@ -319,15 +974,15 @@ fn call_inner<'a>(
         }
     }
 
-    let host_env = FunctionEnv::new(&mut store, HostEnv { memory: None, error: None, return_value: None, logs: vec![], readonly: readonly, rpc_pid: rpc_pid});
+    let host_env = FunctionEnv::new(&mut store, HostEnv { 
+        memory: None, error: None, return_value: None, logs: vec![], 
+        readonly: readonly, rpc_pid: rpc_pid, current_account: it7.to_vec(),
+        instance: None});
+
     let import_log_func = Function::new_typed_with_env(&mut store, &host_env, import_log_implementation);
-    let import_call_func = Function::new_typed_with_env(&mut store, &host_env, import_call_implementation);
     let import_return_value_func = Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation);
     
-    let import_kv_increment_func = Function::new_typed_with_env(&mut store, &host_env, import_kv_increment_implementation);
-
     let abort_func = Function::new_typed_with_env(&mut store, &host_env, abort_implementation);
-
 
     let import_object = imports! {
         "env" => {
@@ -351,18 +1006,24 @@ fn call_inner<'a>(
             "import_log" => import_log_func,
             "import_return_value" => import_return_value_func,
 
-            "import_call" => import_call_func,
+            "import_call" => Function::new_typed_with_env(&mut store, &host_env, import_call_implementation),
 
             //storage
-            "import_kv_put" => Function::new_typed(&mut store, || println!("called_kv_put_in_rust")),
-            "import_kv_put_int" => Function::new_typed(&mut store, || println!("called_kv_put_in_rust")),
-            "import_kv_increment" => import_kv_increment_func,
-            "import_kv_delete" => Function::new_typed(&mut store, || println!("called_kv_put_in_rust")),
-            "import_kv_get" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
-            "import_kv_get_prev" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
-            "import_kv_get_prefix" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
-            "import_kv_exists" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
-            "import_kv_clear" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
+            //"import_storage_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_put_implementation),
+            //"import_storage_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_get_implementation),
+
+            "import_kv_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_put_implementation),
+            "import_kv_increment" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_increment_implementation),
+            "import_kv_delete" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_delete_implementation),
+
+            "import_kv_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_implementation),
+            "import_kv_exists" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_exists_implementation),
+            "import_kv_get_prev" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_prev_implementation),
+            "import_kv_get_next" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_next_implementation),
+
+            //"import_kv_put_int" => Function::new_typed(&mut store, || println!("called_kv_put_in_rust")),
+            //"import_kv_get_prefix" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
+            //"import_kv_clear" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
 
             //AssemblyScript specific
             "abort" => abort_func,
@@ -372,6 +1033,8 @@ fn call_inner<'a>(
 
     let instance = Instance::new(&mut store, &module, &import_object).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
 
+    host_env.as_mut(&mut store).instance = Some(Arc::new(instance.clone()));
+
     let instance_memory = instance.exports.get_memory("memory").map_err(|err| {
         rustler::Error::Term(Box::new(format!(
             "Failed to get 'memory' export from Wasm instance: {}",
@@ -379,9 +1042,13 @@ fn call_inner<'a>(
         )))
     })?;
     host_env.as_mut(&mut store).memory = Some(instance_memory.clone()); // Update env
+    //let mut duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    //println!("ns3 {}", duration_since_epoch.as_nanos());
 
     let entry_to_call = instance.exports.get_function(&function_name).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     let call_result = entry_to_call.call(&mut store, &wasm_args);
+    //let mut duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    //println!("ns4 {}", duration_since_epoch.as_nanos());
 
     let remaining_u64 = match get_remaining_points(&mut store, &instance) {
         MeteringPoints::Remaining(value) => value,
@@ -436,21 +1103,6 @@ fn call_inner<'a>(
 
             Ok((atoms::nil(), atoms::nil(), encoded_logs, remaining_u64, atoms::nil()).encode(env))
         }
-    }
-    //println!("wtf {}", extract_i32_ref(&result1[0]));
-}
-
-fn extract_i32_ref(val: &Value) -> i32 {
-    match val {
-        Value::I32(i) => *i,
-        _ => panic!("Expected Value::I32, got something else"),
-    }
-}
-
-fn extract_i64_ref(val: &Value) -> i64 {
-    match val {
-        Value::I64(i) => *i,
-        _ => panic!("Expected Value::I64, got something else"),
     }
 }
 

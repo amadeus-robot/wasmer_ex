@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 rustler = "0.36.1"
 rand = "0.9.1"
+sha2 = "0.10.8"
 wasmer = "5.0.4"
 wasmer-compiler-singlepass = "5.0.4"
 wasmer-middlewares = "5.0.4"

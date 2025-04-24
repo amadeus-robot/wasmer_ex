@@ -2325,6 +2325,7 @@ version = "0.1.0"
 dependencies = [
  "rand",
  "rustler",
+ "sha2",
  "wasmer",
  "wasmer-compiler-singlepass",
  "wasmer-middlewares",
