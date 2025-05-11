@@ -5,7 +5,7 @@ defmodule WasmerEx.MixProject do
     [
       app: :wasmer_ex,
       version: "0.1.0",
-      elixir: "~> 1.17",
+      elixir: "~> 1.18",
       build_embedded: Mix.env() == :prod,
       start_permanent: Mix.env() == :prod,
       description: "WASMER Runtime in RUST for Elixir",

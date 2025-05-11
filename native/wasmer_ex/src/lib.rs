@@ -42,7 +42,7 @@ static REQ_REGISTRY_STORAGE: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Vec<u8> >
         Mutex::new(HashMap::new())
     });
 
-static REQ_REGISTRY_CALL: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64, Vec<u8>) >>>> = 
+static REQ_REGISTRY_CALL: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Vec<u8>, Vec<Vec<u8>>, u64, Option<Vec<u8>>) >>>> = 
     LazyLock::new(|| {
         Mutex::new(HashMap::new())
     });
@@ -52,6 +52,7 @@ mod atoms {
         ok,
         error,
         nil,
+        result,
 
         rust_request_call,
 
@@ -64,6 +65,26 @@ mod atoms {
         rust_request_storage_kv_exists,
         rust_request_storage_kv_get_prev,
         rust_request_storage_kv_get_next,
+
+        readonly,
+        seed,
+        seedf64,
+        entry_signer,
+        entry_prev_hash,
+        entry_slot,
+        entry_prev_slot,
+        entry_height,
+        entry_epoch,
+        entry_vr,
+        entry_dr,
+        tx_signer,
+        tx_nonce,
+        tx_hash,
+        account_origin,
+        account_caller,
+        account_current,
+        call_counter,
+        call_exec_points,
     }
 }
 
@@ -136,11 +157,11 @@ fn respond_to_rust_storage<'a>(env: Env<'a>, request_id: u64, response: Vec<u8>)
 }
 
 #[rustler::nif]
-fn respond_to_rust_call<'a>(env: Env<'a>, request_id: u64, main_error: Vec<u8>, user_error: Vec<u8>, logs: Vec<Vec<u8>>, exec_cost: u64, result: Vec<u8>) -> NifResult<Term> {
+fn respond_to_rust_call<'a>(env: Env<'a>, request_id: u64, main_error: Vec<u8>, logs: Vec<Vec<u8>>, exec_cost: u64, result: Option<Vec<u8>>) -> NifResult<Term> {
     let mut map = REQ_REGISTRY_CALL.lock().unwrap();
 
     if let Some(tx) = map.remove(&request_id) {
-        let _ = tx.send( (main_error, user_error, logs, exec_cost, result) );
+        let _ = tx.send( (main_error, logs, exec_cost, result) );
         Ok(atoms::ok().encode(env))
     } else {
         Ok((atoms::error(), "no_request_found").encode(env))
@@ -207,7 +228,7 @@ fn import_return_value_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32
         Ok(_) => {
             //println!("return was {}", String::from_utf8_lossy(&buffer));
             data.return_value = Some(buffer);
-            Err(RuntimeError::new("return"))
+            Err(RuntimeError::new("return_value"))
         }
         Err(read_err) => { Err(RuntimeError::new("invalid_memory")) }
     }
@@ -703,7 +724,6 @@ fn import_storage_kv_delete_implementation(mut env: FunctionEnvMut<HostEnv>, key
     key_buffer.extend_from_slice(&key_buffer_suffix);
 
     let (rx, request_id) = request_from_rust_storage_kv_delete(data.rpc_pid, key_buffer);
-
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok(response) => { 
             println!("rpc OK");
@@ -720,8 +740,8 @@ fn import_storage_kv_delete_implementation(mut env: FunctionEnvMut<HostEnv>, key
 }
 
 //CALL
-fn request_from_rust_call<'a>(reply_to_pid: LocalPid, module: Vec<u8>, function: Vec<u8>, args: Vec<u8>) -> (std::sync::mpsc::Receiver< (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64, Vec<u8>) >, u64) {
-    let (tx, rx) = mpsc::channel::< (Vec<u8>, Vec<u8>, Vec<Vec<u8>>, u64, Vec<u8>) >();
+fn request_from_rust_call<'a>(reply_to_pid: LocalPid, remaining_u64: u64, module: Vec<u8>, function: Vec<u8>, args: Vec<Vec<u8>>) -> (std::sync::mpsc::Receiver< (Vec<u8>, Vec<Vec<u8>>, u64, Option<Vec<u8>>) >, u64) {
+    let (tx, rx) = mpsc::channel::< (Vec<u8>, Vec<Vec<u8>>, u64, Option<Vec<u8>>) >();
     let request_id = rand::random::<u64>();
     {
         let mut map = REQ_REGISTRY_CALL.lock().unwrap();
@@ -736,39 +756,87 @@ fn request_from_rust_call<'a>(reply_to_pid: LocalPid, module: Vec<u8>, function:
             owned_module.as_mut_slice().copy_from_slice(&module);
             let mut owned_function = OwnedBinary::new(function.len()).unwrap();
             owned_function.as_mut_slice().copy_from_slice(&function);
-            let mut owned_args = OwnedBinary::new(args.len()).unwrap();
-            owned_args.as_mut_slice().copy_from_slice(&args);
+            let encoded_args: Vec<Binary> = args.iter().map(|bytes| {
+                let mut bin = OwnedBinary::new(bytes.len()).unwrap();
+                bin.as_mut_slice().copy_from_slice(bytes);
+                Binary::from_owned(bin, cenv)
+            })
+            .collect();
 
             let payload = (
                 atoms::rust_request_call(), 
-                request_id, 
+                request_id,
+                remaining_u64,
                 Binary::from_owned(owned_module, cenv),
                 Binary::from_owned(owned_function, cenv),
-                Binary::from_owned(owned_args, cenv));
+                encoded_args
+            );
             payload.encode(cenv)
         });
     });
 
     (rx, request_id)
 }
-fn import_call_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32, module_len: i32, 
-    function_ptr: i32, function_len: i32, args_ptr: i32, args_len: i32) -> Result<i32, RuntimeError> {
-  /*  let (data, store) = env.data_and_store_mut();
-    let memory = match &data.memory {
-        Some(mem) => mem,
-        None => { return Err(RuntimeError::new("invalid_memory")) }
+fn import_call_1_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32, module_len: i32, function_ptr: i32, function_len: i32, 
+    arg_1_ptr: i32, arg_1_len: i32) -> Result<i32, RuntimeError> {
+
+    let (data, mut store) = env.data_and_store_mut();
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
+        MeteringPoints::Remaining(value) => value,
+        MeteringPoints::Exhausted => { 0 }
     };
+
+    let call_cost = (48 + (arg_1_len as u64)) * 1000;
+    remaining_u64 = remaining_u64 - call_cost;
+    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
+    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
 
-    let mut buffer = vec![0u8; module_len as usize];
-    match view.read(module_ptr as u64, &mut buffer) {
-        Ok(_) => {
-            let lol = request_from_rust_call(data.rpc_pid, "hello".to_string());
-            Ok(1)
+    let mut module_buffer = vec![0u8; module_len as usize];
+    let Ok(_) = view.read(module_ptr as u64, &mut module_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut function_buffer = vec![0u8; function_len as usize];
+    let Ok(_) = view.read(function_ptr as u64, &mut function_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+
+    let mut arg_1_buffer = vec![0u8; arg_1_len as usize];
+    let Ok(_) = view.read(arg_1_ptr as u64, &mut arg_1_buffer) else { return Err(RuntimeError::new("invalid_memory")) };
+
+    let mut args = Vec::with_capacity(1);
+    args.push(arg_1_buffer);
+
+    let (rx, request_id) = request_from_rust_call(data.rpc_pid, remaining_u64, module_buffer, function_buffer, args);
+
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok( (error, logs, remaining_exec, result) ) => { 
+            println!("call_1 rpc OK");
+            
+            let _ = view.write(30_000, &((error.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+            let _ = view.write(30_004, &error).map_err(|err| RuntimeError::new("invalid_memory"));
+
+            match result {
+                Some(bytes) => {
+                    let _ = view.write(30_000+4+(error.len() as u64), &((bytes.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                    let _ = view.write(30_000+4+(error.len() as u64)+4, &bytes).map_err(|err| RuntimeError::new("invalid_memory"));
+                }
+                None => {
+                    let _ = view.write(30_000+4+(error.len() as u64), &((0 as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
+                }
+            }
+
+            data.logs.extend(logs);
+            set_remaining_points(&mut store, instance_arc.as_ref(), remaining_exec);
+
+            Ok(30_000)
         }
-        Err(read_err) => { Err(RuntimeError::new("invalid_memory")) }
-    }*/
-    Ok(1)
+        Err(_) => {
+            let mut map = REQ_REGISTRY_CALL.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
 }
 
 fn cost_function(operator: &Operator) -> u64 {
@@ -797,24 +865,6 @@ fn cost_function(operator: &Operator) -> u64 {
 
         _ => 2,
     }*/
-}
-
-#[rustler::nif(schedule = "DirtyCpu")]
-pub fn call<'a>(env: Env<'a>, rpc_pid: LocalPid, wasm_bytes: Binary, readonly: bool, mapenv: Term<'a>, function_name: String, function_args: Vec<Term<'a>>) -> Result<rustler::Term<'a>, rustler::Error> {
-    //let wasm_vec = wasm_bytes.as_slice().to_vec();
-    
-    //let mapenv_decoded: HashMap<String, Term<'a>> = mapenv.decode()?;
-
-    //let (s1, s2, str_vec, number, bytes_vec) = call_inner(env, wasm_bytes, readonly, mapenv, function_name, function_args);
-    //Ok((s1, s2, str_vec, number, bytes_vec).encode(env))
-    /*
-    let payload = (
-        atoms::rust_request(),
-        rpc_pid,
-    );
-    let _ = env.send(&rpc_pid, payload);
-    */
-    call_inner(env, rpc_pid, wasm_bytes, readonly, mapenv, function_name, function_args)
 }
 
 use std::time::{Duration, SystemTime};
@@ -870,16 +920,15 @@ fn get_or_compile_module(wasm_bytes: &[u8]) -> Result<(Arc<Engine>, Arc<Module>)
     Ok((engine, arc_module))
 }
 */
-fn call_inner<'a>(
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn call<'a>(
     env: Env<'a>,
     rpc_pid: LocalPid,
-    wasm_bytes: Binary,
-    readonly: bool,
-    //mapenv: HashMap<String, Term<'a>>,
     mapenv: Term<'a>,
+    wasm_bytes: Binary,
     function_name: String,
     function_args: Vec<Term<'a>>,
-//) -> (String, String, Vec<String>, u64, Vec<u8>) {
 ) -> Result<rustler::Term<'a>, rustler::Error> {
     //TODO: caching
 /*
@@ -888,8 +937,8 @@ fn call_inner<'a>(
     let mut store = Store::new(module_ref.engine().clone());
 */
 
-
-    let metering = Arc::new(Metering::new(10_000_000, cost_function));
+    let exec_points = mapenv.map_get(atoms::call_exec_points())?.decode::<u64>()?;
+    let metering = Arc::new(Metering::new(exec_points, cost_function));
     let mut compiler = Singlepass::default();
     compiler.canonicalize_nans(true);
 
@@ -913,39 +962,39 @@ fn call_inner<'a>(
     let module = Module::new(&store, &wasm_bytes.as_slice()).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
 
 
-
     //let mut duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
     //println!("ns2 {}", duration_since_epoch.as_nanos());
 
     let memory = Memory::new(&mut store, MemoryType::new(Pages(8), None, false)).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     // memory.view(&mut store).copy_to_memory
 
-    let map: HashMap<String, Term> = mapenv.decode()?;
-
-    let it1 = map.get("seed").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it1 = mapenv.map_get(atoms::seed())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(10_000, &((32 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(10_004, it1).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it2 = map.get("entry_signer").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it2 = mapenv.map_get(atoms::entry_signer())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(10_100, &((48 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(10_104, it2).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it3 = map.get("entry_prev_hash").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it3 = mapenv.map_get(atoms::entry_prev_hash())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(10_200, &((32 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(10_204, it3).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it4 = map.get("entry_vr").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it4 = mapenv.map_get(atoms::entry_vr())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(10_300, &((96 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(10_304, it4).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it5 = map.get("entry_dr").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it5 = mapenv.map_get(atoms::entry_dr())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(10_400, &((96 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(10_404, it5).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it6 = map.get("tx_signer").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it6 = mapenv.map_get(atoms::tx_signer())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(11_000, &((48 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(11_004, it6).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it7 = map.get("current_account").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it7 = mapenv.map_get(atoms::account_current())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(12_000, &((it7.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(12_004, it7).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
-    let it8 = map.get("caller_account").ok_or(Error::BadArg)?.decode::<Binary>()?.as_slice();
+    let it8 = mapenv.map_get(atoms::account_caller())?.decode::<Binary>()?.as_slice();
     memory.view(&mut store).write(13_000, &((it8.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(13_004, it8).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it9 = mapenv.map_get(atoms::account_origin())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(14_000, &((it9.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(14_004, it9).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
 
     let mut offset: u64 = 20_000;
     let mut wasm_args: Vec<Value> = Vec::with_capacity(function_args.len());
@@ -976,13 +1025,9 @@ fn call_inner<'a>(
 
     let host_env = FunctionEnv::new(&mut store, HostEnv { 
         memory: None, error: None, return_value: None, logs: vec![], 
-        readonly: readonly, rpc_pid: rpc_pid, current_account: it7.to_vec(),
+        readonly: mapenv.map_get(atoms::readonly())?.decode::<bool>()?,
+        rpc_pid: rpc_pid, current_account: it7.to_vec(),
         instance: None});
-
-    let import_log_func = Function::new_typed_with_env(&mut store, &host_env, import_log_implementation);
-    let import_return_value_func = Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation);
-    
-    let abort_func = Function::new_typed_with_env(&mut store, &host_env, abort_implementation);
 
     let import_object = imports! {
         "env" => {
@@ -990,23 +1035,24 @@ fn call_inner<'a>(
             "seed_ptr" => Global::new(&mut store, Value::I32(10_000)),
             "entry_signer_ptr" => Global::new(&mut store, Value::I32(10_100)),
             "entry_prev_hash_ptr" => Global::new(&mut store, Value::I32(10_200)),
-            "entry_slot" => Global::new(&mut store, Value::I64(map.get("entry_slot").ok_or(Error::BadArg)?.decode::<i64>()?)),
-            "entry_prev_slot" => Global::new(&mut store, Value::I64(map.get("entry_prev_slot").ok_or(Error::BadArg)?.decode::<i64>()?)),
-            "entry_height" => Global::new(&mut store, Value::I64(map.get("entry_height").ok_or(Error::BadArg)?.decode::<i64>()?)),
-            "entry_epoch" => Global::new(&mut store, Value::I64(map.get("entry_epoch").ok_or(Error::BadArg)?.decode::<i64>()?)),
+            "entry_slot" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_slot())?.decode::<i64>()?)),
+            "entry_prev_slot" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_prev_slot())?.decode::<i64>()?)),
+            "entry_height" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_height())?.decode::<i64>()?)),
+            "entry_epoch" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_epoch())?.decode::<i64>()?)),
             "entry_vr_ptr" => Global::new(&mut store, Value::I32(10_300)),
             "entry_dr_ptr" => Global::new(&mut store, Value::I32(10_400)),
 
             "tx_signer_ptr" => Global::new(&mut store, Value::I32(11_000)),
-            "tx_nonce" => Global::new(&mut store, Value::I64(map.get("tx_nonce").ok_or(Error::BadArg)?.decode::<i64>()?)),
+            "tx_nonce" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::tx_nonce())?.decode::<i64>()?)),
 
-            "current_account_ptr" => Global::new(&mut store, Value::I32(12_000)),
-            "caller_account_ptr" => Global::new(&mut store, Value::I32(13_000)),
+            "account_current_ptr" => Global::new(&mut store, Value::I32(12_000)),
+            "account_caller_ptr" => Global::new(&mut store, Value::I32(13_000)),
+            "account_origin_ptr" => Global::new(&mut store, Value::I32(14_000)),
 
-            "import_log" => import_log_func,
-            "import_return_value" => import_return_value_func,
+            "import_log" => Function::new_typed_with_env(&mut store, &host_env, import_log_implementation),
+            "import_return_value" => Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation),
 
-            "import_call" => Function::new_typed_with_env(&mut store, &host_env, import_call_implementation),
+            "import_call_1" => Function::new_typed_with_env(&mut store, &host_env, import_call_1_implementation),
 
             //storage
             //"import_storage_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_put_implementation),
@@ -1026,8 +1072,8 @@ fn call_inner<'a>(
             //"import_kv_clear" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
 
             //AssemblyScript specific
-            "abort" => abort_func,
-            //"seed" => abort_func,
+            "abort" => Function::new_typed_with_env(&mut store, &host_env, abort_implementation),
+            "seed" => Global::new(&mut store, Value::F64(mapenv.map_get(atoms::seedf64())?.decode::<f64>()?)),
         }
     };
 
@@ -1069,7 +1115,7 @@ fn call_inner<'a>(
                 Binary::from_owned(bin, env)
             })
             .collect();
-
+/*
             let data_error = match &data.error {
                 Some(bytes) => {
                     let mut owned = OwnedBinary::new(bytes.len()).unwrap();
@@ -1078,7 +1124,7 @@ fn call_inner<'a>(
                 },
                 None => { atoms::nil().encode(env) }
             };
-
+*/
             let return_value = match &data.return_value {
                 Some(bytes) => {
                     let mut owned = OwnedBinary::new(bytes.len()).unwrap();
@@ -1087,7 +1133,20 @@ fn call_inner<'a>(
                 },
                 None => { atoms::nil().encode(env) }
             };
-            Ok((err.message(), data_error, encoded_logs, remaining_u64, return_value).encode(env))
+
+            let payload = (
+                atoms::result(),
+                (
+                    err.message(),
+                    encoded_logs,
+                    remaining_u64,
+                    return_value,
+                )
+            );
+            env.send(&rpc_pid, payload.encode(env));
+
+            //Ok((err.message(), data_error, encoded_logs, remaining_u64, return_value).encode(env))
+            Ok(atoms::ok().encode(env))
         }
         Ok(_values) => {
             //println!("99 {:?}", get_remaining_points(&mut store, &instance));
@@ -1101,9 +1160,139 @@ fn call_inner<'a>(
             })
             .collect();
 
-            Ok((atoms::nil(), atoms::nil(), encoded_logs, remaining_u64, atoms::nil()).encode(env))
+            let payload = (
+                atoms::result(),
+                (
+                    atoms::nil(),
+                    encoded_logs,
+                    remaining_u64,
+                    atoms::nil(),
+                )
+            );
+            env.send(&rpc_pid, payload.encode(env));
+
+            //Ok((atoms::nil(), atoms::nil(), encoded_logs, remaining_u64, atoms::nil()).encode(env))
+            Ok(atoms::ok().encode(env))
         }
     }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn validate_contract<'a>(
+    env: Env<'a>,
+    mapenv: Term<'a>,
+    wasm_bytes: Binary,
+) -> Result<rustler::Term<'a>, rustler::Error> {
+
+    let metering = Arc::new(Metering::new(10_000_000, cost_function));
+    let mut compiler = Singlepass::default();
+    compiler.canonicalize_nans(true);
+
+    use wasmer::CompilerConfig;
+    compiler.push_middleware(metering);
+
+    let mut features = Features::new();
+    //features.bulk_memory(false); #required for modern compilers to WASM
+    features.threads(false);
+    features.reference_types(false);
+    features.simd(false);
+    features.multi_value(false);
+    features.tail_call(false);
+    features.module_linking(false);
+    features.multi_memory(false);
+    features.memory64(false);
+
+    let engine = EngineBuilder::new(compiler).set_features(Some(features));
+    let mut store = Store::new(engine);
+
+    let module = Module::new(&store, &wasm_bytes.as_slice()).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+
+    let memory = Memory::new(&mut store, MemoryType::new(Pages(8), None, false)).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+
+    let it1 = mapenv.map_get(atoms::seed())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(10_000, &((32 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(10_004, it1).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it2 = mapenv.map_get(atoms::entry_signer())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(10_100, &((48 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(10_104, it2).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it3 = mapenv.map_get(atoms::entry_prev_hash())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(10_200, &((32 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(10_204, it3).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it4 = mapenv.map_get(atoms::entry_vr())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(10_300, &((96 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(10_304, it4).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it5 = mapenv.map_get(atoms::entry_dr())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(10_400, &((96 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(10_404, it5).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it6 = mapenv.map_get(atoms::tx_signer())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(11_000, &((48 as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(11_004, it6).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it7 = mapenv.map_get(atoms::account_current())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(12_000, &((it7.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(12_004, it7).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it8 = mapenv.map_get(atoms::account_caller())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(13_000, &((it8.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(13_004, it8).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    let it9 = mapenv.map_get(atoms::account_origin())?.decode::<Binary>()?.as_slice();
+    memory.view(&mut store).write(14_000, &((it9.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+    memory.view(&mut store).write(14_004, it9).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+
+    let host_env = FunctionEnv::new(&mut store, HostEnv { 
+        memory: None, error: None, return_value: None, logs: vec![], 
+        readonly: true, rpc_pid: env.pid(), current_account: it7.to_vec(),
+        instance: None});
+
+    let import_object = imports! {
+        "env" => {
+            "memory" => memory,
+            "seed_ptr" => Global::new(&mut store, Value::I32(10_000)),
+            "entry_signer_ptr" => Global::new(&mut store, Value::I32(10_100)),
+            "entry_prev_hash_ptr" => Global::new(&mut store, Value::I32(10_200)),
+            "entry_slot" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_slot())?.decode::<i64>()?)),
+            "entry_prev_slot" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_prev_slot())?.decode::<i64>()?)),
+            "entry_height" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_height())?.decode::<i64>()?)),
+            "entry_epoch" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::entry_epoch())?.decode::<i64>()?)),
+            "entry_vr_ptr" => Global::new(&mut store, Value::I32(10_300)),
+            "entry_dr_ptr" => Global::new(&mut store, Value::I32(10_400)),
+
+            "tx_signer_ptr" => Global::new(&mut store, Value::I32(11_000)),
+            "tx_nonce" => Global::new(&mut store, Value::I64(mapenv.map_get(atoms::tx_nonce())?.decode::<i64>()?)),
+
+            "account_current_ptr" => Global::new(&mut store, Value::I32(12_000)),
+            "account_caller_ptr" => Global::new(&mut store, Value::I32(13_000)),
+            "account_origin_ptr" => Global::new(&mut store, Value::I32(14_000)),
+
+            "import_log" => Function::new_typed_with_env(&mut store, &host_env, import_log_implementation),
+            "import_return_value" => Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation),
+
+            "import_call_1" => Function::new_typed_with_env(&mut store, &host_env, import_call_1_implementation),
+
+            //storage
+            //"import_storage_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_put_implementation),
+            //"import_storage_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_get_implementation),
+
+            "import_kv_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_put_implementation),
+            "import_kv_increment" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_increment_implementation),
+            "import_kv_delete" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_delete_implementation),
+
+            "import_kv_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_implementation),
+            "import_kv_exists" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_exists_implementation),
+            "import_kv_get_prev" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_prev_implementation),
+            "import_kv_get_next" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_next_implementation),
+
+            //"import_kv_put_int" => Function::new_typed(&mut store, || println!("called_kv_put_in_rust")),
+            //"import_kv_get_prefix" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
+            //"import_kv_clear" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
+
+            //AssemblyScript specific
+            "abort" => Function::new_typed_with_env(&mut store, &host_env, abort_implementation),
+            "seed" => Global::new(&mut store, Value::F64(mapenv.map_get(atoms::seedf64())?.decode::<f64>()?)),
+        }
+    };
+
+    let instance = Instance::new(&mut store, &module, &import_object).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
+
+    Ok(atoms::ok().encode(env))
 }
 
 rustler::init!("Elixir.WasmerEx");
