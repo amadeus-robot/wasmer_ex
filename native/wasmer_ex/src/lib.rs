@@ -5,7 +5,7 @@ use wasmer::{
     imports,
     wasmparser::Operator,
     sys::{EngineBuilder, Features},
-    Function, FunctionEnv, FunctionEnvMut, FunctionType, Global, Instance, Memory, MemoryType, Engine,
+    AsStoreMut, Function, FunctionEnv, FunctionEnvMut, FunctionType, Global, Instance, Memory, MemoryType, Engine,
     MemoryView, Module, Pages, Store, Type, Value,
     RuntimeError
 };
@@ -24,69 +24,30 @@ static MODULE_CACHE: OnceLock<Mutex<HashMap<[u8; 32], (Arc<Engine>, Arc<Module>)
 
 use rand::random;
 use std::{sync::{LazyLock, mpsc}};
-static REQ_REGISTRY_STORAGE_KV_GET: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Option<Vec<u8>> >>>> = 
+static REQ_REGISTRY_STORAGE_KV_GET: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Option<Vec<u8>> >>>> =
     LazyLock::new(|| {
         Mutex::new(HashMap::new())
     });
-static REQ_REGISTRY_STORAGE_KV_EXISTS: LazyLock<Mutex<HashMap<u64, mpsc::Sender< bool >>>> = 
+static REQ_REGISTRY_STORAGE_KV_EXISTS: LazyLock<Mutex<HashMap<u64, mpsc::Sender< bool >>>> =
     LazyLock::new(|| {
         Mutex::new(HashMap::new())
     });
-static REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Option<Vec<u8>>, Option<Vec<u8>>) >>>> = 
-    LazyLock::new(|| {
-        Mutex::new(HashMap::new())
-    });
-
-static REQ_REGISTRY_STORAGE: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Vec<u8> >>>> = 
+static REQ_REGISTRY_STORAGE_KV_GET_PREV_NEXT: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Option<Vec<u8>>, Option<Vec<u8>>) >>>> =
     LazyLock::new(|| {
         Mutex::new(HashMap::new())
     });
 
-static REQ_REGISTRY_CALL: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Vec<u8>, Vec<Vec<u8>>, u64, Option<Vec<u8>>) >>>> = 
+static REQ_REGISTRY_STORAGE: LazyLock<Mutex<HashMap<u64, mpsc::Sender< Vec<u8> >>>> =
     LazyLock::new(|| {
         Mutex::new(HashMap::new())
     });
 
-mod atoms {
-    rustler::atoms! {
-        ok,
-        error,
-        nil,
-        result,
+static REQ_REGISTRY_CALL: LazyLock<Mutex<HashMap<u64, mpsc::Sender< (Vec<u8>, Vec<Vec<u8>>, u64, Option<Vec<u8>>) >>>> =
+    LazyLock::new(|| {
+        Mutex::new(HashMap::new())
+    });
 
-        rust_request_call,
-
-        rust_request_storage_kv_put,
-        rust_request_storage_kv_increment,
-        rust_request_storage_kv_delete,
-        rust_request_storage_kv_clear,
-
-        rust_request_storage_kv_get,
-        rust_request_storage_kv_exists,
-        rust_request_storage_kv_get_prev,
-        rust_request_storage_kv_get_next,
-
-        readonly,
-        seed,
-        seedf64,
-        entry_signer,
-        entry_prev_hash,
-        entry_slot,
-        entry_prev_slot,
-        entry_height,
-        entry_epoch,
-        entry_vr,
-        entry_dr,
-        tx_signer,
-        tx_nonce,
-        tx_hash,
-        account_origin,
-        account_caller,
-        account_current,
-        call_counter,
-        call_exec_points,
-    }
-}
+mod atoms;
 
 #[derive(Debug, Clone, Copy)]
 struct ExitCode(u32);
@@ -168,6 +129,44 @@ fn respond_to_rust_call<'a>(env: Env<'a>, request_id: u64, main_error: Vec<u8>, 
     }
 }
 
+#[inline]
+fn charge_points<S>(store: &mut S, instance: &Instance, cost: u64) -> Result<u64, RuntimeError> where S: AsStoreMut {
+    let remaining = match get_remaining_points(store, instance) {
+        MeteringPoints::Remaining(v) => v,
+        MeteringPoints::Exhausted => 0,
+    };
+
+    if cost > remaining { return Err(RuntimeError::new("unreachable"));  }
+    let new_remaining = remaining - cost;
+    set_remaining_points(store, instance, new_remaining);
+    Ok(new_remaining)
+}
+
+#[inline]
+fn build_prefixed_key(view: &MemoryView, prefix: &[u8], ptr: i32, len: i32) -> Result<Vec<u8>, RuntimeError> {
+    let mut out = Vec::with_capacity(prefix.len() + 1 + len as usize);
+    out.extend_from_slice(prefix);
+    out.push(b':');
+
+    let start = out.len();
+    out.resize(start + len as usize, 0);
+
+    view.read(ptr as u64, &mut out[start..]).map_err(|_| RuntimeError::new("invalid_memory"))?;
+
+    Ok(out)
+}
+
+#[inline]
+fn write_i32(view: &MemoryView, offset: u64, value: i32) -> Result<(), RuntimeError> {
+    view.write(offset, &value.to_le_bytes()).map_err(|_| RuntimeError::new("invalid_memory"))
+}
+
+#[inline]
+fn write_bin(view: &MemoryView, offset: u64, slice: &[u8]) -> Result<(), RuntimeError> {
+    view.write(offset, slice).map_err(|_| RuntimeError::new("invalid_memory"))
+}
+
+
 //AssemblyScript specific
 fn abort_implementation(mut env: FunctionEnvMut<HostEnv>, _message: i32, _fileName: i32, line: i32, column: i32) -> Result<(), RuntimeError> {
     let (data, store) = env.data_and_store_mut();
@@ -175,20 +174,12 @@ fn abort_implementation(mut env: FunctionEnvMut<HostEnv>, _message: i32, _fileNa
 }
 
 fn import_log_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32) -> Result<(), RuntimeError> {
+    let cost = (len as u64) * 1000;
+
     let (data, mut store) = env.data_and_store_mut();
 
-    //charge exec cost
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (len as u64) * 1000;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
-
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -205,20 +196,12 @@ fn import_log_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i3
 }
 
 fn import_return_value_implementation(mut env: FunctionEnvMut<HostEnv>, ptr: i32, len: i32) -> Result<(), RuntimeError> {
+    let cost = (len as u64) * 1000;
+
     let (data, mut store) = env.data_and_store_mut();
-    
-    //charge exec cost
+
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (len as u64) * 1000;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
-
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -252,8 +235,8 @@ fn request_from_rust_storage_kv_get(reply_to_pid: LocalPid, key: Vec<u8>) -> (st
             let mut owned_key = OwnedBinary::new(key.len()).unwrap();
             owned_key.as_mut_slice().copy_from_slice(&key);
             let payload = (
-                atoms::rust_request_storage_kv_get(), 
-                request_id, 
+                atoms::rust_request_storage_kv_get(),
+                request_id,
                 Binary::from_owned(owned_key, cenv));
             payload.encode(cenv)
         });
@@ -262,41 +245,38 @@ fn request_from_rust_storage_kv_get(reply_to_pid: LocalPid, key: Vec<u8>) -> (st
     (rx, request_id)
 }
 fn import_storage_kv_get_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64)) * 100;
+
     let (data, mut store) = env.data_and_store_mut();
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64)) * 100;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
 
-    let mut key_buffer_suffix = vec![0u8; key_len as usize];
-    let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
-    let mut key_buffer = data.current_account.clone();
-    key_buffer.extend_from_slice(&key_buffer_suffix);
+    let key_buffer = build_prefixed_key(&view, &data.current_account, key_ptr, key_len)?;
+
+    //let mut key_buffer_suffix = vec![0u8; key_len as usize];
+    //let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    //let mut key_buffer = data.current_account.clone();
+    //key_buffer.extend_from_slice(b":");
+    //key_buffer.extend_from_slice(&key_buffer_suffix);
 
     let (rx, request_id) = request_from_rust_storage_kv_get(data.rpc_pid, key_buffer);
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
-        Ok(option_response) => { 
+        Ok(option_response) => {
             match option_response {
                 Some(response) => {
                     println!("rpc OK with Some(...)");
-                    let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+                    write_i32(&view, 30_000, response.len() as i32)?;
+                    write_bin(&view, 30_004, &response)?;
                     Ok(30_000)
                 },
                 None => {
                     println!("rpc OK with None");
-                    let _ = view.write(30_000, &(-1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+                    write_i32(&view, 30_000, -1)?;
                     Ok(30_000)
                 }
             }
@@ -324,8 +304,8 @@ fn request_from_rust_storage_kv_exists(reply_to_pid: LocalPid, key: Vec<u8>) -> 
             let mut owned_key = OwnedBinary::new(key.len()).unwrap();
             owned_key.as_mut_slice().copy_from_slice(&key);
             let payload = (
-                atoms::rust_request_storage_kv_exists(), 
-                request_id, 
+                atoms::rust_request_storage_kv_exists(),
+                request_id,
                 Binary::from_owned(owned_key, cenv));
             payload.encode(cenv)
         });
@@ -334,18 +314,12 @@ fn request_from_rust_storage_kv_exists(reply_to_pid: LocalPid, key: Vec<u8>) -> 
     (rx, request_id)
 }
 fn import_storage_kv_exists_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64)) * 100;
+
     let (data, mut store) = env.data_and_store_mut();
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64)) * 100;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -353,17 +327,18 @@ fn import_storage_kv_exists_implementation(mut env: FunctionEnvMut<HostEnv>, key
     let mut key_buffer_suffix = vec![0u8; key_len as usize];
     let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
     let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(b":");
     key_buffer.extend_from_slice(&key_buffer_suffix);
 
     let (rx, request_id) = request_from_rust_storage_kv_exists(data.rpc_pid, key_buffer);
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok(true) => {
-            let _ = view.write(30_000, &(1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+            write_i32(&view, 30_000, 1)?;
             Ok(30_000)
         },
         Ok(false) => {
-            let _ = view.write(30_000, &(0 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+            write_i32(&view, 30_000, 0)?;
             Ok(30_000)
         },
         Err(_) => {
@@ -391,8 +366,8 @@ fn request_from_rust_storage_kv_get_prev(reply_to_pid: LocalPid, suffix: Vec<u8>
             let mut owned_key = OwnedBinary::new(key.len()).unwrap();
             owned_key.as_mut_slice().copy_from_slice(&key);
             let payload = (
-                atoms::rust_request_storage_kv_get_prev(), 
-                request_id, 
+                atoms::rust_request_storage_kv_get_prev(),
+                request_id,
                 Binary::from_owned(owned_suffix, cenv),
                 Binary::from_owned(owned_key, cenv));
             payload.encode(cenv)
@@ -402,18 +377,12 @@ fn request_from_rust_storage_kv_get_prev(reply_to_pid: LocalPid, suffix: Vec<u8>
     (rx, request_id)
 }
 fn import_storage_kv_get_prev_implementation(mut env: FunctionEnvMut<HostEnv>, suffix_ptr: i32, suffix_len: i32, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64)) * 100;
+
     let (data, mut store) = env.data_and_store_mut();
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64)) * 100;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -421,6 +390,7 @@ fn import_storage_kv_get_prev_implementation(mut env: FunctionEnvMut<HostEnv>, s
     let mut suffix_buffer_suffix = vec![0u8; suffix_len as usize];
     let Ok(_) = view.read(suffix_ptr as u64, &mut suffix_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
     let mut suffix_buffer = data.current_account.clone();
+    suffix_buffer.extend_from_slice(b":");
     suffix_buffer.extend_from_slice(&suffix_buffer_suffix);
 
     let mut key_buffer = vec![0u8; key_len as usize];
@@ -433,14 +403,15 @@ fn import_storage_kv_get_prev_implementation(mut env: FunctionEnvMut<HostEnv>, s
             match (maybe_prev_key, maybe_value) {
                 (Some(prev_key), Some(value)) => {
                     println!("Got Some(prev_key), Some(value)");
-                    let _ = view.write(30_000, &((prev_key.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_004, &prev_key).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_000+4+(prev_key.len() as u64), &((value.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_004+4+(prev_key.len() as u64)+4, &value).map_err(|err| RuntimeError::new("invalid_memory"));
+                    write_i32(&view, 30_000, prev_key.len() as i32)?;
+                    write_bin(&view, 30_004, &prev_key)?;
+
+                    write_i32(&view, 30_004+(prev_key.len() as u64), value.len() as i32)?;
+                    write_bin(&view, 30_004+(prev_key.len() as u64)+4, &value)?;
                     Ok(30_000)
                 },
                 _ => {
-                    let _ = view.write(30_000, &(-1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+                    write_i32(&view, 30_000, -1)?;
                     Ok(30_000)
                 }
             }
@@ -471,8 +442,8 @@ fn request_from_rust_storage_kv_get_next(reply_to_pid: LocalPid, suffix: Vec<u8>
             let mut owned_key = OwnedBinary::new(key.len()).unwrap();
             owned_key.as_mut_slice().copy_from_slice(&key);
             let payload = (
-                atoms::rust_request_storage_kv_get_next(), 
-                request_id, 
+                atoms::rust_request_storage_kv_get_next(),
+                request_id,
                 Binary::from_owned(owned_suffix, cenv),
                 Binary::from_owned(owned_key, cenv));
             payload.encode(cenv)
@@ -482,18 +453,12 @@ fn request_from_rust_storage_kv_get_next(reply_to_pid: LocalPid, suffix: Vec<u8>
     (rx, request_id)
 }
 fn import_storage_kv_get_next_implementation(mut env: FunctionEnvMut<HostEnv>, suffix_ptr: i32, suffix_len: i32, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64)) * 100;
+
     let (data, mut store) = env.data_and_store_mut();
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64)) * 100;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -501,6 +466,7 @@ fn import_storage_kv_get_next_implementation(mut env: FunctionEnvMut<HostEnv>, s
     let mut suffix_buffer_suffix = vec![0u8; suffix_len as usize];
     let Ok(_) = view.read(suffix_ptr as u64, &mut suffix_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
     let mut suffix_buffer = data.current_account.clone();
+    suffix_buffer.extend_from_slice(b":");
     suffix_buffer.extend_from_slice(&suffix_buffer_suffix);
 
     let mut key_buffer = vec![0u8; key_len as usize];
@@ -513,14 +479,14 @@ fn import_storage_kv_get_next_implementation(mut env: FunctionEnvMut<HostEnv>, s
             match (maybe_next_key, maybe_value) {
                 (Some(next_key), Some(value)) => {
                     println!("Got Some(next_key), Some(value)");
-                    let _ = view.write(30_000, &((next_key.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_004, &next_key).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_000+4+(next_key.len() as u64), &((value.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-                    let _ = view.write(30_004+4+(next_key.len() as u64)+4, &value).map_err(|err| RuntimeError::new("invalid_memory"));
+                    write_i32(&view, 30_000, next_key.len() as i32)?;
+                    write_bin(&view, 30_004, &next_key)?;
+                    write_i32(&view, 30_004+(next_key.len() as u64), value.len() as i32)?;
+                    write_bin(&view, 30_004+(next_key.len() as u64)+4, &value)?;
                     Ok(30_000)
                 },
                 _ => {
-                    let _ = view.write(30_000, &(-1 as i32).to_le_bytes()).map_err(|err| RuntimeError::new("invalid_memory"));
+                    write_i32(&view, 30_000, -1)?;
                     Ok(30_000)
                 }
             }
@@ -550,8 +516,8 @@ fn request_from_rust_storage_kv_put<'a>(reply_to_pid: LocalPid, key: Vec<u8>, va
             let mut owned_val = OwnedBinary::new(val.len()).unwrap();
             owned_val.as_mut_slice().copy_from_slice(&val);
             let payload = (
-                atoms::rust_request_storage_kv_put(), 
-                request_id, 
+                atoms::rust_request_storage_kv_put(),
+                request_id,
                 Binary::from_owned(owned_key, cenv),
                 Binary::from_owned(owned_val, cenv));
             payload.encode(cenv)
@@ -561,21 +527,13 @@ fn request_from_rust_storage_kv_put<'a>(reply_to_pid: LocalPid, key: Vec<u8>, va
     (rx, request_id)
 }
 fn import_storage_kv_put_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64) + (val_len as u64)) * 1000;
+
     let (data, mut store) = env.data_and_store_mut();
     if data.readonly { return Err(RuntimeError::new("read_only")) }
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    //let instance_ref: &Instance = instance_arc.as_ref();
-    //let Some(instance) = &data.instance else { return Err(RuntimeError::new("invalid_instance")) };
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64) + (val_len as u64)) * 1000;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -583,6 +541,7 @@ fn import_storage_kv_put_implementation(mut env: FunctionEnvMut<HostEnv>, key_pt
     let mut key_buffer_suffix = vec![0u8; key_len as usize];
     let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
     let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(b":");
     key_buffer.extend_from_slice(&key_buffer_suffix);
 
     let mut val_buffer = vec![0u8; val_len as usize];
@@ -591,10 +550,11 @@ fn import_storage_kv_put_implementation(mut env: FunctionEnvMut<HostEnv>, key_pt
     let (rx, request_id) = request_from_rust_storage_kv_put(data.rpc_pid, key_buffer, val_buffer);
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
-        Ok(response) => { 
+        Ok(response) => {
             println!("rpc OK");
-            let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-            let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+
+            write_i32(&view, 30_000, response.len() as i32)?;
+            write_bin(&view, 30_004, &response)?;
             Ok(30_000)
         }
         Err(_) => {
@@ -623,8 +583,8 @@ fn request_from_rust_storage_kv_increment<'a>(reply_to_pid: LocalPid, key: Vec<u
             let mut owned_val = OwnedBinary::new(val.len()).unwrap();
             owned_val.as_mut_slice().copy_from_slice(&val);
             let payload = (
-                atoms::rust_request_storage_kv_increment(), 
-                request_id, 
+                atoms::rust_request_storage_kv_increment(),
+                request_id,
                 Binary::from_owned(owned_key, cenv),
                 Binary::from_owned(owned_val, cenv));
             payload.encode(cenv)
@@ -634,19 +594,13 @@ fn request_from_rust_storage_kv_increment<'a>(reply_to_pid: LocalPid, key: Vec<u
     (rx, request_id)
 }
 fn import_storage_kv_increment_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64) + (val_len as u64)) * 1000;
+
     let (data, mut store) = env.data_and_store_mut();
     if data.readonly { return Err(RuntimeError::new("read_only")) }
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64) + (val_len as u64)) * 1000;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -654,6 +608,7 @@ fn import_storage_kv_increment_implementation(mut env: FunctionEnvMut<HostEnv>, 
     let mut key_buffer_suffix = vec![0u8; key_len as usize];
     let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
     let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(b":");
     key_buffer.extend_from_slice(&key_buffer_suffix);
 
     let mut val_buffer = vec![0u8; val_len as usize];
@@ -662,10 +617,11 @@ fn import_storage_kv_increment_implementation(mut env: FunctionEnvMut<HostEnv>, 
     let (rx, request_id) = request_from_rust_storage_kv_increment(data.rpc_pid, key_buffer, val_buffer);
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
-        Ok(response) => { 
+        Ok(response) => {
             println!("rpc OK");
-            let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-            let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+
+            write_i32(&view, 30_000, response.len() as i32)?;
+            write_bin(&view, 30_004, &response)?;
             Ok(30_000)
         }
         Err(_) => {
@@ -691,8 +647,8 @@ fn request_from_rust_storage_kv_delete<'a>(reply_to_pid: LocalPid, key: Vec<u8>)
             let mut owned_key = OwnedBinary::new(key.len()).unwrap();
             owned_key.as_mut_slice().copy_from_slice(&key);
             let payload = (
-                atoms::rust_request_storage_kv_delete(), 
-                request_id, 
+                atoms::rust_request_storage_kv_delete(),
+                request_id,
                 Binary::from_owned(owned_key, cenv));
             payload.encode(cenv)
         });
@@ -701,19 +657,13 @@ fn request_from_rust_storage_kv_delete<'a>(reply_to_pid: LocalPid, key: Vec<u8>)
     (rx, request_id)
 }
 fn import_storage_kv_delete_implementation(mut env: FunctionEnvMut<HostEnv>, key_ptr: i32, key_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (key_len as u64)) * 1000;
+
     let (data, mut store) = env.data_and_store_mut();
     if data.readonly { return Err(RuntimeError::new("read_only")) }
 
     let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
-    let mut remaining_u64 = match get_remaining_points(&mut store, instance_arc.as_ref()) {
-        MeteringPoints::Remaining(value) => value,
-        MeteringPoints::Exhausted => { 0 }
-    };
-
-    let storage_cost = (48 + (key_len as u64)) * 1000;
-    remaining_u64 = remaining_u64 - storage_cost;
-    if remaining_u64 <= 0 { return Err(RuntimeError::new("unreachable")) };
-    set_remaining_points(&mut store, instance_arc.as_ref(), remaining_u64);
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
 
     let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
     let view: MemoryView = memory.view(&store);
@@ -721,14 +671,16 @@ fn import_storage_kv_delete_implementation(mut env: FunctionEnvMut<HostEnv>, key
     let mut key_buffer_suffix = vec![0u8; key_len as usize];
     let Ok(_) = view.read(key_ptr as u64, &mut key_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
     let mut key_buffer = data.current_account.clone();
+    key_buffer.extend_from_slice(b":");
     key_buffer.extend_from_slice(&key_buffer_suffix);
 
     let (rx, request_id) = request_from_rust_storage_kv_delete(data.rpc_pid, key_buffer);
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
-        Ok(response) => { 
+        Ok(response) => {
             println!("rpc OK");
-            let _ = view.write(30_000, &((response.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-            let _ = view.write(30_004, &response).map_err(|err| RuntimeError::new("invalid_memory"));
+
+            write_i32(&view, 30_000, response.len() as i32)?;
+            write_bin(&view, 30_004, &response)?;
             Ok(30_000)
         }
         Err(_) => {
@@ -738,6 +690,66 @@ fn import_storage_kv_delete_implementation(mut env: FunctionEnvMut<HostEnv>, key
         }
     }
 }
+
+//CLEAR
+fn request_from_rust_storage_kv_clear<'a>(reply_to_pid: LocalPid, prefix: Vec<u8>) -> (std::sync::mpsc::Receiver<Vec<u8>>, u64) {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let request_id = rand::random::<u64>();
+    {
+        let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+        map.insert(request_id, tx);
+    }
+
+    std::thread::spawn(move || {
+        let mut env = OwnedEnv::new();
+        let _ = env.send_and_clear(&reply_to_pid, |cenv| {
+            let mut owned_prefix = OwnedBinary::new(prefix.len()).unwrap();
+            owned_prefix.as_mut_slice().copy_from_slice(&prefix);
+            let payload = (
+                atoms::rust_request_storage_kv_delete(),
+                request_id,
+                Binary::from_owned(owned_prefix, cenv));
+            payload.encode(cenv)
+        });
+    });
+
+    (rx, request_id)
+}
+fn import_storage_kv_clear_implementation(mut env: FunctionEnvMut<HostEnv>, prefix_ptr: i32, prefix_len: i32) -> Result<i32, RuntimeError> {
+    let cost = (48 + (prefix_len as u64)) * 1000;
+
+    let (data, mut store) = env.data_and_store_mut();
+    if data.readonly { return Err(RuntimeError::new("read_only")) }
+
+    let instance_arc = data.instance.as_ref().ok_or_else(|| RuntimeError::new("invalid_instance"))?;
+    let remaining_u64 = charge_points(&mut store, instance_arc.as_ref(), cost)?;
+
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    let mut prefix_buffer_suffix = vec![0u8; prefix_len as usize];
+    let Ok(_) = view.read(prefix_ptr as u64, &mut prefix_buffer_suffix) else { return Err(RuntimeError::new("invalid_memory")) };
+    let mut prefix_buffer = data.current_account.clone();
+    prefix_buffer.extend_from_slice(b":");
+    prefix_buffer.extend_from_slice(&prefix_buffer_suffix);
+
+    let (rx, request_id) = request_from_rust_storage_kv_clear(data.rpc_pid, prefix_buffer);
+    match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(response) => {
+            println!("rpc OK");
+
+            write_i32(&view, 30_000, response.len() as i32)?;
+            write_bin(&view, 30_004, &response)?;
+            Ok(30_000)
+        }
+        Err(_) => {
+            let mut map = REQ_REGISTRY_STORAGE.lock().unwrap();
+            map.remove(&request_id);
+            Err(RuntimeError::new("no_elixir_callback"))
+        }
+    }
+}
+
 
 //CALL
 fn request_from_rust_call<'a>(reply_to_pid: LocalPid, remaining_u64: u64, module: Vec<u8>, function: Vec<u8>, args: Vec<Vec<u8>>) -> (std::sync::mpsc::Receiver< (Vec<u8>, Vec<Vec<u8>>, u64, Option<Vec<u8>>) >, u64) {
@@ -764,7 +776,7 @@ fn request_from_rust_call<'a>(reply_to_pid: LocalPid, remaining_u64: u64, module
             .collect();
 
             let payload = (
-                atoms::rust_request_call(), 
+                atoms::rust_request_call(),
                 request_id,
                 remaining_u64,
                 Binary::from_owned(owned_module, cenv),
@@ -777,7 +789,7 @@ fn request_from_rust_call<'a>(reply_to_pid: LocalPid, remaining_u64: u64, module
 
     (rx, request_id)
 }
-fn import_call_1_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32, module_len: i32, function_ptr: i32, function_len: i32, 
+fn import_call_1_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i32, module_len: i32, function_ptr: i32, function_len: i32,
     arg_1_ptr: i32, arg_1_len: i32) -> Result<i32, RuntimeError> {
 
     let (data, mut store) = env.data_and_store_mut();
@@ -810,11 +822,11 @@ fn import_call_1_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i3
     let (rx, request_id) = request_from_rust_call(data.rpc_pid, remaining_u64, module_buffer, function_buffer, args);
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
-        Ok( (error, logs, remaining_exec, result) ) => { 
+        Ok( (error, logs, remaining_exec, result) ) => {
             println!("call_1 rpc OK");
-            
-            let _ = view.write(30_000, &((error.len() as i32).to_le_bytes())).map_err(|err| RuntimeError::new("invalid_memory"));
-            let _ = view.write(30_004, &error).map_err(|err| RuntimeError::new("invalid_memory"));
+
+            write_i32(&view, 30_000, error.len() as i32)?;
+            write_bin(&view, 30_004, &error)?;
 
             match result {
                 Some(bytes) => {
@@ -937,7 +949,7 @@ fn call<'a>(
     let mut store = Store::new(module_ref.engine().clone());
 */
 
-    let exec_points = mapenv.map_get(atoms::call_exec_points())?.decode::<u64>()?;
+    let exec_points = mapenv.map_get(atoms::call_exec_points_remaining())?.decode::<u64>()?;
     let metering = Arc::new(Metering::new(exec_points, cost_function));
     let mut compiler = Singlepass::default();
     compiler.canonicalize_nans(true);
@@ -1023,8 +1035,8 @@ fn call<'a>(
         }
     }
 
-    let host_env = FunctionEnv::new(&mut store, HostEnv { 
-        memory: None, error: None, return_value: None, logs: vec![], 
+    let host_env = FunctionEnv::new(&mut store, HostEnv {
+        memory: None, error: None, return_value: None, logs: vec![],
         readonly: mapenv.map_get(atoms::readonly())?.decode::<bool>()?,
         rpc_pid: rpc_pid, current_account: it7.to_vec(),
         instance: None});
@@ -1052,15 +1064,13 @@ fn call<'a>(
             "import_log" => Function::new_typed_with_env(&mut store, &host_env, import_log_implementation),
             "import_return_value" => Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation),
 
-            "import_call_1" => Function::new_typed_with_env(&mut store, &host_env, import_call_1_implementation),
+            //"import_call_1" => Function::new_typed_with_env(&mut store, &host_env, import_call_1_implementation),
 
             //storage
-            //"import_storage_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_put_implementation),
-            //"import_storage_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_get_implementation),
-
             "import_kv_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_put_implementation),
             "import_kv_increment" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_increment_implementation),
             "import_kv_delete" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_delete_implementation),
+            "import_kv_clear" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_clear_implementation),
 
             "import_kv_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_implementation),
             "import_kv_exists" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_exists_implementation),
@@ -1108,7 +1118,7 @@ fn call<'a>(
             let data = host_env.as_ref(&store); // Read-only access to HostEnv data
 
             //println!("wtf {:?} {:?} {:?} {:?} {}", data.error, data.return_value, err.message(), err.to_string(), String::from_utf8_lossy(data.return_value.as_ref().unwrap()));
-        
+
             let encoded_logs: Vec<Binary> = data.logs.iter().map(|bytes| {
                 let mut bin = OwnedBinary::new(bytes.len()).unwrap();
                 bin.as_mut_slice().copy_from_slice(bytes);
@@ -1237,8 +1247,8 @@ fn validate_contract<'a>(
     memory.view(&mut store).write(14_000, &((it9.len() as i32).to_le_bytes())).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
     memory.view(&mut store).write(14_004, it9).map_err(|err| rustler::Error::Term(Box::new(err.to_string())))?;
 
-    let host_env = FunctionEnv::new(&mut store, HostEnv { 
-        memory: None, error: None, return_value: None, logs: vec![], 
+    let host_env = FunctionEnv::new(&mut store, HostEnv {
+        memory: None, error: None, return_value: None, logs: vec![],
         readonly: true, rpc_pid: env.pid(), current_account: it7.to_vec(),
         instance: None});
 
@@ -1265,7 +1275,7 @@ fn validate_contract<'a>(
             "import_log" => Function::new_typed_with_env(&mut store, &host_env, import_log_implementation),
             "import_return_value" => Function::new_typed_with_env(&mut store, &host_env, import_return_value_implementation),
 
-            "import_call_1" => Function::new_typed_with_env(&mut store, &host_env, import_call_1_implementation),
+            //"import_call_1" => Function::new_typed_with_env(&mut store, &host_env, import_call_1_implementation),
 
             //storage
             //"import_storage_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_put_implementation),
@@ -1274,6 +1284,7 @@ fn validate_contract<'a>(
             "import_kv_put" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_put_implementation),
             "import_kv_increment" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_increment_implementation),
             "import_kv_delete" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_delete_implementation),
+            "import_kv_clear" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_clear_implementation),
 
             "import_kv_get" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_get_implementation),
             "import_kv_exists" => Function::new_typed_with_env(&mut store, &host_env, import_storage_kv_exists_implementation),
@@ -1282,7 +1293,6 @@ fn validate_contract<'a>(
 
             //"import_kv_put_int" => Function::new_typed(&mut store, || println!("called_kv_put_in_rust")),
             //"import_kv_get_prefix" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
-            //"import_kv_clear" => Function::new_typed(&mut store, || println!("called_kv_get_in_rust")),
 
             //AssemblyScript specific
             "abort" => Function::new_typed_with_env(&mut store, &host_env, abort_implementation),
@@ -1296,4 +1306,3 @@ fn validate_contract<'a>(
 }
 
 rustler::init!("Elixir.WasmerEx");
-
