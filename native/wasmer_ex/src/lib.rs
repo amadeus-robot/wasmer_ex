@@ -433,7 +433,6 @@ fn import_storage_kv_get_prev_implementation(mut env: FunctionEnvMut<HostEnv>, s
         Ok((maybe_prev_key, maybe_value)) => {
             match (maybe_prev_key, maybe_value) {
                 (Some(prev_key), Some(value)) => {
-                    println!("Got Some(prev_key), Some(value)");
                     write_i32(&view, 30_000, prev_key.len() as i32)?;
                     write_bin(&view, 30_004, &prev_key)?;
 
@@ -511,7 +510,6 @@ fn import_storage_kv_get_next_implementation(mut env: FunctionEnvMut<HostEnv>, s
         Ok((maybe_next_key, maybe_value)) => {
             match (maybe_next_key, maybe_value) {
                 (Some(next_key), Some(value)) => {
-                    println!("Got Some(next_key), Some(value)");
                     write_i32(&view, 30_000, next_key.len() as i32)?;
                     write_bin(&view, 30_004, &next_key)?;
                     write_i32(&view, 30_004+(next_key.len() as u64), value.len() as i32)?;
@@ -853,6 +851,8 @@ fn import_call_0_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i3
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok( (error, logs, remaining_exec, result) ) => {
+            if error != b"ok" { return Err(RuntimeError::new("xcc_failed")); }
+
             data.attached_symbol = Vec::new();
             data.attached_amount = Vec::new();
 
@@ -911,6 +911,8 @@ fn import_call_1_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i3
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok( (error, logs, remaining_exec, result) ) => {
+            if error != b"ok" { return Err(RuntimeError::new("xcc_failed")); }
+
             data.attached_symbol = Vec::new();
             data.attached_amount = Vec::new();
 
@@ -972,6 +974,8 @@ fn import_call_2_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i3
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok( (error, logs, remaining_exec, result) ) => {
+            if error != b"ok" { return Err(RuntimeError::new("xcc_failed")); }
+
             data.attached_symbol = Vec::new();
             data.attached_amount = Vec::new();
 
@@ -1036,6 +1040,8 @@ fn import_call_3_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i3
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok( (error, logs, remaining_exec, result) ) => {
+            if error != b"ok" { return Err(RuntimeError::new("xcc_failed")); }
+
             data.attached_symbol = Vec::new();
             data.attached_amount = Vec::new();
 
@@ -1103,6 +1109,8 @@ fn import_call_4_implementation(mut env: FunctionEnvMut<HostEnv>, module_ptr: i3
 
     match rx.recv_timeout(std::time::Duration::from_secs(6)) {
         Ok( (error, logs, remaining_exec, result) ) => {
+            if error != b"ok" { return Err(RuntimeError::new("xcc_failed")); }
+
             data.attached_symbol = Vec::new();
             data.attached_amount = Vec::new();
 
