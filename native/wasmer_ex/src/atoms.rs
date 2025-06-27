@@ -36,4 +36,6 @@ rustler::atoms! {
     call_counter,
     call_exec_points,
     call_exec_points_remaining,
+    attached_symbol,
+    attached_amount,
 }
