@@ -172,10 +172,37 @@ fn write_bin(view: &MemoryView, offset: u64, slice: &[u8]) -> Result<(), Runtime
     view.write(offset, slice).map_err(|_| RuntimeError::new("invalid_memory"))
 }
 
-
 //AssemblyScript specific
-fn abort_implementation(mut env: FunctionEnvMut<HostEnv>, _message: i32, _fileName: i32, _line: i32, _column: i32) -> Result<(), RuntimeError> {
-    let (data, store) = env.data_and_store_mut();
+fn abort_implementation(mut env: FunctionEnvMut<HostEnv>, msg_ptr: i32, filename_ptr: i32, line: i32, column: i32) -> Result<(), RuntimeError> {
+    let (data, mut store) = env.data_and_store_mut();
+    let Some(memory) = &data.memory else { return Err(RuntimeError::new("invalid_memory")) };
+    let view: MemoryView = memory.view(&store);
+
+    //I kill thee
+    let mut msg_size_bytes = [0u8; 4];
+    let Ok(_) = view.read((msg_ptr as u64) - 4, &mut msg_size_bytes) else { return Err(RuntimeError::new("invalid_memory")) };
+    let msg_size: i32 = i32::from_le_bytes(msg_size_bytes);
+    let mut msg_buff_utf16 = vec![0u8; msg_size as usize];
+    let Ok(_) = view.read(msg_ptr as u64, &mut msg_buff_utf16) else { return Err(RuntimeError::new("invalid_memory")) };
+    let msg_buff_utf16_b4collect = msg_buff_utf16.chunks_exact(2).map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+    let msg_buff_utf16_collected: Vec<u16> = msg_buff_utf16_b4collect.collect();
+
+    let mut filename_size_bytes = [0u8; 4];
+    let Ok(_) = view.read((filename_ptr as u64) - 4, &mut filename_size_bytes) else { return Err(RuntimeError::new("invalid_memory")) };
+    let filename_size: i32 = i32::from_le_bytes(filename_size_bytes);
+    let mut filename_buff_utf16 = vec![0u8; filename_size as usize];
+    let Ok(_) = view.read(filename_ptr as u64, &mut filename_buff_utf16) else { return Err(RuntimeError::new("invalid_memory")) };
+    let filename_buff_utf16_b4collect = filename_buff_utf16.chunks_exact(2).map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+    let filename_buff_utf16_collected: Vec<u16> = filename_buff_utf16_b4collect.collect();
+
+    let msg_utf8 = match String::from_utf16(&msg_buff_utf16_collected) { Ok(s) => s, Err(_) => { return Err(RuntimeError::new("invalid_memory")); }};
+    let filename_utf8 = match String::from_utf16(&filename_buff_utf16_collected) { Ok(s) => s, Err(_) => { return Err(RuntimeError::new("invalid_memory")); }};
+
+    let formatted = format!("{} | {} {} {}", msg_utf8, filename_utf8, line, column);
+    data.return_value = Some(formatted.into_bytes());
+
+    //println!("{} {} {} {}", msg_utf8, filename_utf8, line, column);
+
     Err(RuntimeError::new("abort"))
 }
 
