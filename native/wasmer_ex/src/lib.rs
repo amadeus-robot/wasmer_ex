@@ -145,20 +145,17 @@ fn charge_points<S>(store: &mut S, instance: &Instance, cost: u64) -> Result<u64
     Ok(new_remaining)
 }
 
-#[inline]
 fn build_prefixed_key(view: &MemoryView, prefix: &[u8], ptr: i32, len: i32) -> Result<Vec<u8>, RuntimeError> {
     const CONTRACT: &[u8] = b"c:";
-    let mut out = Vec::with_capacity(CONTRACT.len() + prefix.len() + 1 + len as usize);
 
+    let mut body = vec![0u8; len as usize];
+    view.read(ptr as u64, &mut body).map_err(|_| RuntimeError::new("invalid_memory"))?;
+
+    let mut out = Vec::with_capacity(CONTRACT.len() + prefix.len() + 1 + body.len());
     out.extend_from_slice(CONTRACT);
     out.extend_from_slice(prefix);
     out.push(b':');
-
-    let start = out.len();
-    out.resize(start + len as usize, 0);
-
-    view.read(ptr as u64, &mut out[start..]).map_err(|_| RuntimeError::new("invalid_memory"))?;
-
+    out.extend_from_slice(&body);
     Ok(out)
 }
 
